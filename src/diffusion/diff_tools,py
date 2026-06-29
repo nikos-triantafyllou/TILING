@@ -1,0 +1,826 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import math 
+import numpy as np
+
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ooooooooooooo ooooo ooo        ooooo oooooooooooo      oooooooooooo ooo        ooooo oooooooooo.  oooooooooo.  oooooooooooo oooooooooo.   ooooo ooooo      ooo   .oooooo.     .oooooo..o 
+# 8'   888   `8 `888' `88.       .888' `888'     `8      `888'     `8 `88.       .888' `888'   `Y8b `888'   `Y8b `888'     `8 `888'   `Y8b  `888' `888b.     `8'  d8P'  `Y8b   d8P'    `Y8 
+#      888       888   888b     d'888   888               888          888b     d'888   888     888  888     888  888          888      888  888   8 `88b.    8  888           Y88bo.      
+#      888       888   8 Y88. .P  888   888oooo8          888oooo8     8 Y88. .P  888   888oooo888'  888oooo888'  888oooo8     888      888  888   8   `88b.  8  888            `"Y8888o.  
+#      888       888   8  `888'   888   888    "          888    "     8  `888'   888   888    `88b  888    `88b  888    "     888      888  888   8     `88b.8  888     ooooo      `"Y88b 
+#      888       888   8    Y     888   888       o       888       o  8    Y     888   888    .88P  888    .88P  888       o  888     d88'  888   8       `888  `88.    .88'  oo     .d8P 
+#     o888o     o888o o8o        o888o o888ooooood8      o888ooooood8 o8o        o888o o888bood8P'  o888bood8P'  o888ooooood8 o888bood8P'   o888o o8o        `8   `Y8bood8P'   8""88888P'  
+                                                                                                                                                                                         
+
+
+# Discrete Time embedding - Sionusoidal
+class SinousoidalEmbedding(nn.Module):
+    def __init__(self, emb_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(emb_dim * 4, emb_dim*4) 
+        )
+
+    def forward(self, t: torch.Tensor):
+        """
+        t: (N,) timesteps (int or float)
+        returns: (N, emb_dim)
+        """
+        # sinusoidal embedding
+        half_dim = self.mlp[0].in_features // 2
+        device = t.device
+        freqs = torch.exp(
+            -math.log(10_000.0) * torch.arange(0, half_dim, device=device).float() / (half_dim -1)
+        )
+        args = t[:, None].float() * freqs[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return self.mlp(emb)
+    
+
+# Continuous Time embedding - Same as Legin+2024
+class GaussianFourierProjection(nn.Module):
+    """Gaussian Fourier embeddings for noise levels."""
+    def __init__(self, emb_dim=64, scale=16.0):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(emb_dim) * scale, requires_grad=False)
+        # Combine with the linear layers here - same as Legin without initializations and with output divided by 4 for injection to Unet here
+        self.mlp = nn.Sequential(
+        nn.Linear(2 * emb_dim, 4 * emb_dim),
+        nn.SiLU(),
+        nn.Linear(4 * emb_dim, 4*emb_dim) # Here output size was *4
+        )
+
+    def forward(self, x): # x is sigma
+        x = torch.log(x)
+        x_proj = x[:, None] * self.W[None, :] * 2 * np.pi
+        emb = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+        return self.mlp(emb) # Combine with the linear layers here
+    
+class FourierFeatureEmbedding(nn.Module):
+    def __init__(
+        self,
+        base_dim,   # 128
+        scale=16.0, # 16  (see the paper in https://arxiv.org/pdf/2011.13456)
+    ):
+        super().__init__()
+
+        # randomly sampled b
+        # (no learnable parameters, but it must be saved !)
+        self.b = nn.Parameter(
+            torch.randn(base_dim) * scale,
+            requires_grad=False
+        )
+
+    def forward(self, t):
+        t_log = torch.log(t) # (apply as uniform-log variables)
+        out = t_log[:, None] * self.b[None, :] # shape: [batch_size, base_dim]
+        out = out * 2 * math.pi                # shape: [batch_size, base_dim]
+        out = torch.cat([
+            torch.sin(out),
+            torch.cos(out)
+        ], dim=-1)                             # shape: [batch_size, base_dim*2]
+        return out
+    
+
+
+# TimestepEmbedding =  SinousoidalEmbedding   
+TimestepEmbedding =  GaussianFourierProjection
+# TimestepEmbedding = FourierFeatureEmbedding
+
+
+
+
+
+# ooo        ooooo       .o.       ooooooooo.     .oooo.   ooo        ooooo       .o.       ooooooooo.   
+# `88.       .888'      .888.      `888   `Y88. .dP""Y88b  `88.       .888'      .888.      `888   `Y88. 
+#  888b     d'888      .8"888.      888   .d88'       ]8P'  888b     d'888      .8"888.      888   .d88' 
+#  8 Y88. .P  888     .8' `888.     888ooo88P'      .d8P'   8 Y88. .P  888     .8' `888.     888ooo88P'  
+#  8  `888'   888    .88ooo8888.    888           .dP'      8  `888'   888    .88ooo8888.    888         
+#  8    Y     888   .8'     `888.   888         .oP     .o  8    Y     888   .8'     `888.   888         
+# o8o        o888o o88o     o8888o o888o        8888888888 o8o        o888o o88o     o8888o o888o        
+                                                                                                       
+                                                                                                       
+                                                                                                       
+
+
+class ConvBlock(nn.Module):
+    """Convolution blocks of the form specified by `seq`.
+
+    `seq` types:
+    'C': convolution specified by `kernel_size` and `stride`
+    'B': normalization (to be renamed to 'N')
+    'A': activation
+    'U': upsampling transposed convolution of kernel size 2 and stride 2
+    'D': downsampling convolution of kernel size 2 and stride 2
+    """
+    def __init__(self, in_chan, out_chan=None, mid_chan=None,
+            kernel_size=3, stride=1, seq='CBA'):
+        super().__init__()
+
+        if out_chan is None:
+            out_chan = in_chan
+
+        self.in_chan = in_chan
+        self.out_chan = out_chan
+        if mid_chan is None:
+            self.mid_chan = max(in_chan, out_chan)
+        else: self.mid_chan = mid_chan
+            
+        self.kernel_size = kernel_size
+        self.stride = stride
+
+        self.norm_chan = in_chan
+        self.idx_conv = 0
+        self.num_conv = sum([seq.count(l) for l in ['U', 'D', 'C']])
+
+        layers = [self._get_layer(l) for l in seq]
+
+        self.convs = nn.Sequential(*layers)
+
+    def _get_layer(self, l):
+        if l == 'U':
+            in_chan, out_chan = self._setup_conv()
+            return nn.ConvTranspose3d(in_chan, out_chan, 2, stride=2)
+        elif l == 'D':
+            in_chan, out_chan = self._setup_conv()
+            return nn.Conv3d(in_chan, out_chan, 2, stride=2)
+        elif l == 'C':
+            in_chan, out_chan = self._setup_conv()
+            return nn.Conv3d(in_chan, out_chan, self.kernel_size,
+                    stride=self.stride, padding='same')
+        elif l == 'B':
+            return nn.GroupNorm(num_groups=4, num_channels=self.norm_chan)
+#             return nn.InstanceNorm3d(self.norm_chan, affine=True, track_running_stats=True)
+#             return nn.InstanceNorm3d(self.norm_chan)
+        elif l == 'A':
+            return nn.LeakyReLU()
+        else:
+            raise ValueError('layer type {} not supported'.format(l))
+
+    def _setup_conv(self):
+        self.idx_conv += 1
+
+        in_chan = out_chan = self.mid_chan
+        if self.idx_conv == 1:
+            in_chan = self.in_chan
+        if self.idx_conv == self.num_conv:
+            out_chan = self.out_chan
+
+        self.norm_chan = out_chan
+
+        return in_chan, out_chan
+
+    def forward_old(self, x):
+        return self.convs(x)
+
+    
+    def forward(self, x, t_emb=None):
+        h = x
+        for layer in self.convs:
+            if isinstance(layer, nn.GroupNorm):
+                h = layer(h)
+                if t_emb!=None:
+                    # inject BEFORE activation
+                    h = h + t_emb
+            else:
+                h = layer(h)
+        return h
+
+    
+    
+    
+class UNet(nn.Module):
+    def __init__(self, in_chan, out_chan, cond_chan, ICs_NGPE = 'None', bypass=False, base_channels=64, **kwargs):
+        super().__init__()
+        self.ICs_NGPE = ICs_NGPE
+        if self.ICs_NGPE=='simple_conditioning':
+            cond_chan += 1 
+        elif self.ICs_NGPE=='residual_increments':
+            cond_chan += 1 
+        
+        total_in = in_chan + cond_chan
+        self.time_emb = TimestepEmbedding(base_channels)              # embedding
+        self.time_proj = nn.Linear(base_channels * 4, base_channels)  # project embedding to match layer outputs
+
+        self.conv_l0 = ConvBlock(total_in, base_channels, seq='CACBA')
+        self.down_l0 = ConvBlock(base_channels, seq='DBA')
+        self.conv_l1 = ConvBlock(base_channels, seq='CBACBA')
+        self.down_l1 = ConvBlock(base_channels, seq='DBA')
+
+        self.conv_c = ConvBlock(base_channels, seq='CBACBA')
+
+        self.up_r1 = ConvBlock(base_channels, seq='UBA')
+        self.conv_r1 = ConvBlock(base_channels*2, base_channels, base_channels, seq='CBACBA') # change middle channel here (reduce by a factor of 2)
+        self.up_r0 = ConvBlock(base_channels, seq='UBA')
+        self.conv_r0 = ConvBlock(base_channels*2, out_chan, seq='CAC')
+
+        self.bypass = in_chan == out_chan
+
+    def forward(self, x_t, t, cond):
+        if self.ICs_NGPE=='simple_conditioning' or self.ICs_NGPE=='None': 
+            ICs_NGPE = 0  
+            # keep cond the same for regular conditioning
+        elif self.ICs_NGPE == 'residual_whole':
+            ICs_NGPE = 0 
+            cond = cond[:, :-1, :, :, :] # remove last channel for conditioning, it will go on the label
+        elif self.ICs_NGPE == 'residual_increments':
+            cond = cond[:, :-1, :, :, :] # remove last channel for conditioning, it will go on the end
+            ICs_NGPE =  cond[:, -1, :, :, :] / 1000
+        # elif self.ICs_NGPE==False:
+        #     ICs_NGPE = 0
+        # Time embedding
+        t_emb = self.time_proj(F.silu(self.time_emb(t)))   # (N, C)
+        t_emb = t_emb[:, :, None, None, None] # Broadcast it
+#         if self.bypass:
+#             x0 = x
+
+        x = torch.cat([x_t, cond], dim=1)
+    
+        # Encoder
+        y0 = self.conv_l0(x, t_emb)
+        x = self.down_l0(y0, t_emb)
+        
+
+        y1 = self.conv_l1(x, t_emb)
+        x = self.down_l1(y1, t_emb)
+
+                      # (N, C, 1,1,1)
+            
+        # Bottleneck
+        x = self.conv_c(x, t_emb)
+#         x = x + t_emb  # inject
+
+
+        # Decoder
+        x = self.up_r1(x, t_emb)
+#         y1 = narrow_by(y1, 4)
+        x = torch.cat([y1, x], dim=1) # Skip connection
+        x = self.conv_r1(x, t_emb)
+
+        x = self.up_r0(x, t_emb)
+#         y0 = narrow_by(y0, 2)
+        x = torch.cat([y0, x], dim=1) # Skip connection
+        x = self.conv_r0(x,t_emb)
+
+#         if self.bypass:
+#             x += x0
+
+
+        return x + ICs_NGPE
+        # x + ICs_NGPE
+
+
+
+
+
+
+
+
+
+# ███████╗ █████╗ ███╗   ███╗██████╗ ██╗     ██╗███╗   ██╗ ██████╗ 
+# ██╔════╝██╔══██╗████╗ ████║██╔══██╗██║     ██║████╗  ██║██╔════╝ 
+# ███████╗███████║██╔████╔██║██████╔╝██║     ██║██╔██╗ ██║██║  ███╗
+# ╚════██║██╔══██║██║╚██╔╝██║██╔═══╝ ██║     ██║██║╚██╗██║██║   ██║
+# ███████║██║  ██║██║ ╚═╝ ██║██║     ███████╗██║██║ ╚████║╚██████╔╝
+# ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝     ╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
+                                                                 
+
+
+
+
+
+#  Euler-Maruyama sampling ------------------------------------------
+
+def run_inference(unet, x_0, cond, beta_min, beta_max, eps, N, device, ICs_NGPE='None', ema = None):
+    """
+    Run Euler-Maruyama sampling for the given UNet model.
+    Inputs:
+    - unet: the trained UNet model
+    - x_0: initial noise tensor (shape: [batch_size, channels, D
+        , H, W])
+    - cond: conditioning tensor (shape: [batch_size, cond_channels, D, H, W])
+    - beta_min: minimum beta value for SDE
+    - beta_max: maximum beta value for SDE
+    - eps: small value to avoid numerical issues
+    - N: number of diffusion steps
+    Returns:
+    - x: generated samples (shape: [batch_size, channels, D, H,
+        W])
+    """
+
+    unet.eval()
+
+    t_steps = torch.linspace(1.0, 0.0, N).to(device) * (1.0 - eps) + eps
+    x = x_0
+    b = x_0.size(dim=0)
+    if ema is not None:
+        with torch.no_grad(), ema.average_parameters():
+            # (showing progress, because it needs a lot of time.)
+            # for i, t in tqdm(enumerate(t_steps), total=N):
+            print("Sampling...", flush = True)
+            for i, t in enumerate(t_steps):
+                model_out = unet(x, t.repeat(b), cond)
+                beta_t = beta_min + (beta_max - beta_min) * t
+                z = torch.randn_like(x).to(device)
+                if i == N-1:
+                    x = x + (beta_t / N) * (0.5 * x + model_out)
+                else:
+                    x = x + (beta_t / N) * (0.5 * x + model_out) + torch.sqrt(beta_t / N) * z
+    else:
+        with torch.no_grad():
+            # (showing progress, because it needs a lot of time.)
+            # for i, t in tqdm(enumerate(t_steps), total=N):
+            print("Sampling...", flush = True)
+            for i, t in enumerate(t_steps):
+                model_out = unet(x, t.repeat(b), cond)
+                beta_t = beta_min + (beta_max - beta_min) * t
+                z = torch.randn_like(x).to(device)
+                if i == N-1:
+                    x = x + (beta_t / N) * (0.5 * x + model_out)
+                else:
+                    x = x + (beta_t / N) * (0.5 * x + model_out) + torch.sqrt(beta_t / N) * z
+
+    # clip
+#     x = torch.clamp(x, min=0.0, max=1.0)
+    # if ICs_NGPE=='residual_whole':
+    #     return x + cond[:, -1, :, :, :]  # add back the mean if normalized
+    # else:
+    return x 
+
+
+
+
+
+
+# def plot_in_training():
+
+
+
+
+
+
+# ████████╗███████╗███████╗████████╗    ██████╗ ██╗      ██████╗ ████████╗████████╗██╗███╗   ██╗ ██████╗ 
+# ╚══██╔══╝██╔════╝██╔════╝╚══██╔══╝    ██╔══██╗██║     ██╔═══██╗╚══██╔══╝╚══██╔══╝██║████╗  ██║██╔════╝ 
+#    ██║   █████╗  ███████╗   ██║       ██████╔╝██║     ██║   ██║   ██║      ██║   ██║██╔██╗ ██║██║  ███╗
+#    ██║   ██╔══╝  ╚════██║   ██║       ██╔═══╝ ██║     ██║   ██║   ██║      ██║   ██║██║╚██╗██║██║   ██║
+#    ██║   ███████╗███████║   ██║       ██║     ███████╗╚██████╔╝   ██║      ██║   ██║██║ ╚████║╚██████╔╝
+#    ╚═╝   ╚══════╝╚══════╝   ╚═╝       ╚═╝     ╚══════╝ ╚═════╝    ╚═╝      ╚═╝   ╚═╝╚═╝  ╚═══╝ ╚═════╝ 
+
+
+
+
+def plot_test_all(box_length, x_0, x, cond, return08=False): 
+
+    x_inferred = x.detach().cpu().numpy()[0, 0]  # shape (D,H,W)
+    cond_np = cond.detach().cpu().numpy()[0]       # shape (2,D,H,W)
+    # ----------------------------------------------------
+    # Plotting (slices through the 3D field)
+    # ----------------------------------------------------
+    slice_idx = box_length // 2
+
+
+    extent = [0, box_length*1.5, 0 , box_length*1.5]
+    fig, axs = plt.subplots(2, 4, figsize=(12, 6))
+    axs[0,0].imshow(cond_np[0, slice_idx], cmap='viridis', extent=extent)
+    axs[0,0].set_title("21cm")
+    if cond_np.shape[0]>1:
+        axs[0,1].imshow(cond_np[1, slice_idx], cmap='viridis', extent=extent)
+        axs[0,1].set_title("Galaxies")
+    axs[0,2].imshow(x_inferred[slice_idx], cmap='viridis', extent=extent, vmin=-3, vmax=3 )
+    axs[0,2].set_title("Inferred ICs")
+    axs[0,3].imshow(x_0[0,0, slice_idx].to('cpu'), cmap='viridis', extent=extent, vmin=-3, vmax=3)
+    axs[0,3].set_title("True ICs")
+    for i in range(4):
+        axs[0,i].set_xlabel('x axis [Mpc]')
+    axs[0,0].set_ylabel('y axis [Mpc]')
+
+    plt.tight_layout()
+    
+    
+    
+    bins=np.linspace(-5,5,100)
+    x_inferred = x.detach().cpu().numpy()[0, 0]  # shape (D,H,W)
+    axs[1,0].hist(x_inferred.flatten(), bins=bins, alpha=0.3, label='inferred');
+    axs[1,0].hist(x_0[0,0,:,:,:].to('cpu').flatten(), bins=bins, alpha=0.3, label='true');
+    axs[1,0].legend(loc = 'lower left');
+
+
+    
+    import powerbox as pbox
+    pk1, k1 = pbox.get_power(x_inferred,box_length*1.5, log_bins=False)
+    pk2, k2 = pbox.get_power(x_0[0,0,:,:,:].to('cpu'), box_length*1.5, log_bins=False)
+    axs[1,1].loglog(k1,pk1, label='inferred')
+    axs[1,1].loglog(k2,pk2, label='true')
+    axs[1,1].legend(loc = 'lower left')
+    
+    
+    pk, k = pbox.get_power(deltax= x_inferred, boxlength = box_length*1.5, deltax2 = x_0[0,0,:,:,:].to('cpu'), log_bins=False)
+    pk = pk/np.sqrt(pk1*pk2)
+    axs[1,2].plot(k,pk)
+    axs[1,2].set_xscale('log')
+    pk = np.nan_to_num(pk)
+    k80 = k[np.argmin(abs(pk - 0.8))]
+    axs[1,2].axvline(k80, color='black', linestyle='--', alpha=0.5)
+    axs[1,2].text(0.9, 0.8,f'0.8 at {round(k80,2)}')
+
+    if return08:
+        return fig, k80
+    else: 
+        return fig
+
+
+
+
+
+
+
+
+
+
+
+
+
+#   .oooooo.          .o.       ooooooooo.   oooooooooo.        .o.         .oooooo.    oooooooooooo 
+#  d8P'  `Y8b        .888.      `888   `Y88. `888'   `Y8b      .888.       d8P'  `Y8b   `888'     `8 
+# 888               .8"888.      888   .d88'  888     888     .8"888.     888            888         
+# 888              .8' `888.     888ooo88P'   888oooo888'    .8' `888.    888            888oooo8    
+# 888     ooooo   .88ooo8888.    888`88b.     888    `88b   .88ooo8888.   888     ooooo  888    "    
+# `88.    .88'   .8'     `888.   888  `88b.   888    .88P  .8'     `888.  `88.    .88'   888       o 
+#  `Y8bood8P'   o88o     o8888o o888o  o888o o888bood8P'  o88o     o8888o  `Y8bood8P'   o888ooooood8 
+                                                                                                   
+                                                                                                   
+                                                                                                   
+
+
+# GARBAGE
+
+# class TimestepEmbedding(nn.Module):
+#     def __init__(self, emb_dim: int):
+#         super().__init__()
+#         self.mlp = nn.Sequential(
+#             nn.Linear(emb_dim, emb_dim * 4),
+#             nn.SiLU(),
+#             nn.Linear(emb_dim * 4, emb_dim)
+#         )
+
+#     def forward(self, t: torch.Tensor):
+#         """
+#         t: (N,) timesteps (int or float)
+#         returns: (N, emb_dim)
+#         """
+#         # sinusoidal embedding
+#         half_dim = self.mlp[0].in_features // 2
+#         device = t.device
+#         freqs = torch.exp(
+#             -math.log(10_000.0) * torch.arange(0, half_dim, device=device).float() / half_dim
+#         )
+#         args = t[:, None].float() * freqs[None, :]
+#         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+#         return self.mlp(emb)
+    
+    
+# class ConditionalDiffusionCNN3D(nn.Module):
+#     def __init__(self, in_channels, cond_channels, out_channels, base_channels=64):
+#         super().__init__()
+#         total_in = in_channels + cond_channels  # combine condition + noisy target
+#         self.time_emb = TimestepEmbedding(base_channels)
+#         self.time_proj = nn.Linear(base_channels, base_channels * 2)
+
+#         self.encoder = nn.Sequential(
+#             nn.Conv3d(total_in, base_channels, 3, padding=1),
+#             nn.SiLU(),
+#             nn.Conv3d(base_channels, base_channels * 2, 3, stride=2, padding=1),
+#             nn.SiLU(),
+#         )
+
+#         self.bottleneck = nn.Conv3d(base_channels * 2, base_channels * 2, 3, padding=1)
+
+#         self.decoder = nn.Sequential(
+#             nn.ConvTranspose3d(base_channels * 2, base_channels, 4, stride=2, padding=1),
+#             nn.SiLU(),
+#             nn.Conv3d(base_channels, out_channels, 3, padding=1)
+#         )
+
+#     def forward(self, x_t, t, cond):
+#         # concat conditioning along channels
+#         x = torch.cat([x_t, cond], dim=1)
+
+#         # get time embedding and inject
+#         t_emb = self.time_emb(t)
+#         t_proj = self.time_proj(F.silu(t_emb))[:, :, None, None, None]
+
+#         out = self.encoder(x)
+#         out = out + t_proj
+#         out = F.silu(self.bottleneck(out))
+#         out = self.decoder(out)
+#         return out
+
+
+
+
+
+#  ▄▄       ▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄       ▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄ 
+# ▐░░▌     ▐░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░░▌     ▐░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌
+# ▐░▌░▌   ▐░▐░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌ ▀▀▀▀▀▀▀▀▀█░▌▐░▌░▌   ▐░▐░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌
+# ▐░▌▐░▌ ▐░▌▐░▌▐░▌       ▐░▌▐░▌       ▐░▌          ▐░▌▐░▌▐░▌ ▐░▌▐░▌▐░▌       ▐░▌▐░▌       ▐░▌
+# ▐░▌ ▐░▐░▌ ▐░▌▐░█▄▄▄▄▄▄▄█░▌▐░█▄▄▄▄▄▄▄█░▌          ▐░▌▐░▌ ▐░▐░▌ ▐░▌▐░█▄▄▄▄▄▄▄█░▌▐░█▄▄▄▄▄▄▄█░▌
+# ▐░▌  ▐░▌  ▐░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌ ▄▄▄▄▄▄▄▄▄█░▌▐░▌  ▐░▌  ▐░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌
+# ▐░▌   ▀   ▐░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀▀▀ ▐░░░░░░░░░░░▌▐░▌   ▀   ▐░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀▀▀ 
+# ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌          ▐░█▀▀▀▀▀▀▀▀▀ ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌          
+# ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌          ▐░█▄▄▄▄▄▄▄▄▄ ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌          
+# ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌          ▐░░░░░░░░░░░▌▐░▌       ▐░▌▐░▌       ▐░▌▐░▌          
+#  ▀         ▀  ▀         ▀  ▀            ▀▀▀▀▀▀▀▀▀▀▀  ▀         ▀  ▀         ▀  ▀           
+                                                                                       
+
+
+
+# class ConvBlock(nn.Module):
+#     """Convolution blocks of the form specified by `seq`.
+
+#     `seq` types:
+#     'C': convolution specified by `kernel_size` and `stride`
+#     'B': normalization (to be renamed to 'N')
+#     'A': activation
+#     'U': upsampling transposed convolution of kernel size 2 and stride 2
+#     'D': downsampling convolution of kernel size 2 and stride 2
+#     """
+#     def __init__(self, in_chan, out_chan=None, mid_chan=None,
+#             kernel_size=3, stride=1, seq='CBA'):
+#         super().__init__()
+
+#         if out_chan is None:
+#             out_chan = in_chan
+
+#         self.in_chan = in_chan
+#         self.out_chan = out_chan
+#         if mid_chan is None:
+#             self.mid_chan = max(in_chan, out_chan)
+#         self.kernel_size = kernel_size
+#         self.stride = stride
+
+#         self.norm_chan = in_chan
+#         self.idx_conv = 0
+#         self.num_conv = sum([seq.count(l) for l in ['U', 'D', 'C']])
+
+#         layers = [self._get_layer(l) for l in seq]
+
+#         self.convs = nn.Sequential(*layers)
+
+#     def _get_layer(self, l):
+#         if l == 'U':
+#             in_chan, out_chan = self._setup_conv()
+#             return nn.ConvTranspose3d(in_chan, out_chan, 2, stride=2)
+#         elif l == 'D':
+#             in_chan, out_chan = self._setup_conv()
+#             return nn.Conv3d(in_chan, out_chan, 2, stride=2)
+#         elif l == 'C':
+#             in_chan, out_chan = self._setup_conv()
+#             return nn.Conv3d(in_chan, out_chan, self.kernel_size,
+#                     stride=self.stride)
+#         elif l == 'B':
+#             return nn.BatchNorm3d(self.norm_chan)
+#             #return nn.InstanceNorm3d(self.norm_chan, affine=True, track_running_stats=True)
+#             #return nn.InstanceNorm3d(self.norm_chan)
+#         elif l == 'A':
+#             return nn.LeakyReLU()
+#         else:
+#             raise ValueError('layer type {} not supported'.format(l))
+
+#     def _setup_conv(self):
+#         self.idx_conv += 1
+
+#         in_chan = out_chan = self.mid_chan
+#         if self.idx_conv == 1:
+#             in_chan = self.in_chan
+#         if self.idx_conv == self.num_conv:
+#             out_chan = self.out_chan
+
+#         self.norm_chan = out_chan
+
+#         return in_chan, out_chan
+
+#     def forward(self, x):
+#         return self.convs(x)
+
+
+
+
+
+# class UNet(nn.Module):
+#     def __init__(self, in_chan, out_chan, bypass=False, **kwargs):
+#         """U-Net like network
+
+#         Note:
+
+#         Global bypass connection adding the input to the output (similar to
+#         COLA for displacement input and output) from Alvaro Sanchez Gonzalez.
+#         Enabled by default when in_chan equals out_chan
+
+#         Global bypass, under additive symmetry, effectively obviates --aug-add
+#         """
+#         super().__init__()
+
+#         self.conv_l0 = ConvBlock(in_chan, 64, seq='CACBA')
+#         self.down_l0 = ConvBlock(64, seq='DBA')
+#         self.conv_l1 = ConvBlock(64, seq='CBACBA')
+#         self.down_l1 = ConvBlock(64, seq='DBA')
+
+#         self.conv_c = ConvBlock(64, seq='CBACBA')
+
+#         self.up_r1 = ConvBlock(64, seq='UBA')
+#         self.conv_r1 = ConvBlock(128, 64, seq='CBACBA')
+#         self.up_r0 = ConvBlock(64, seq='UBA')
+#         self.conv_r0 = ConvBlock(128, out_chan, seq='CAC')
+
+#         self.bypass = in_chan == out_chan
+
+#     def forward(self, x):
+#         if self.bypass:
+#             x0 = x
+
+#         y0 = self.conv_l0(x)
+#         x = self.down_l0(y0)
+
+#         y1 = self.conv_l1(x)
+#         x = self.down_l1(y1)
+
+#         x = self.conv_c(x)
+
+#         x = self.up_r1(x)
+#         # y1 = narrow_by(y1, 4)
+#         x = torch.cat([y1, x], dim=1)
+#         del y1
+#         x = self.conv_r1(x)
+
+#         x = self.up_r0(x)
+#         # y0 = narrow_by(y0, 16)
+#         x = torch.cat([y0, x], dim=1)
+#         del y0
+#         x = self.conv_r0(x)
+
+#         if self.bypass:
+#             # x0 = narrow_by(x0, 20)
+#             x += x0
+
+#         return x
+
+
+
+
+
+
+
+# class ConvBlock(nn.Module):
+#     """Convolution blocks of the form specified by `seq`.
+
+#     `seq` types:
+#     'C': convolution specified by `kernel_size` and `stride`
+#     'B': normalization (to be renamed to 'N')
+#     'A': activation
+#     'U': upsampling transposed convolution of kernel size 2 and stride 2
+#     'D': downsampling convolution of kernel size 2 and stride 2
+#     """
+#     def __init__(self, in_chan, out_chan=None, mid_chan=None,
+#             kernel_size=3, stride=1, seq='CBA'):
+#         super().__init__()
+
+#         if out_chan is None:
+#             out_chan = in_chan
+
+#         self.in_chan = in_chan
+#         self.out_chan = out_chan
+#         if mid_chan is None:
+#             self.mid_chan = max(in_chan, out_chan)
+#         else: self.mid_chan = mid_chan
+            
+#         self.kernel_size = kernel_size
+#         self.stride = stride
+
+#         self.norm_chan = in_chan
+#         self.idx_conv = 0
+#         self.num_conv = sum([seq.count(l) for l in ['U', 'D', 'C']])
+
+#         layers = [self._get_layer(l) for l in seq]
+
+#         self.convs = nn.Sequential(*layers)
+
+#     def _get_layer(self, l):
+#         if l == 'U':
+#             in_chan, out_chan = self._setup_conv()
+#             return nn.ConvTranspose3d(in_chan, out_chan, 2, stride=2)
+#         elif l == 'D':
+#             in_chan, out_chan = self._setup_conv()
+#             return nn.Conv3d(in_chan, out_chan, 2, stride=2)
+#         elif l == 'C':
+#             in_chan, out_chan = self._setup_conv()
+#             return nn.Conv3d(in_chan, out_chan, self.kernel_size,
+#                     stride=self.stride, padding='same')
+#         elif l == 'B':
+#             return nn.BatchNorm3d(self.norm_chan)
+# #             return nn.InstanceNorm3d(self.norm_chan, affine=True, track_running_stats=True)
+# #             return nn.InstanceNorm3d(self.norm_chan)
+#         elif l == 'A':
+#             return nn.LeakyReLU()
+#         else:
+#             raise ValueError('layer type {} not supported'.format(l))
+
+#     def _setup_conv(self):
+#         self.idx_conv += 1
+
+#         in_chan = out_chan = self.mid_chan
+#         if self.idx_conv == 1:
+#             in_chan = self.in_chan
+#         if self.idx_conv == self.num_conv:
+#             out_chan = self.out_chan
+
+#         self.norm_chan = out_chan
+
+#         return in_chan, out_chan
+
+#     def forward_old(self, x):
+#         return self.convs(x)
+
+    
+#     def forward(self, x, t_emb=None):
+#         h = x
+#         for layer in self.convs:
+#             if isinstance(layer, nn.BatchNorm3d):
+#                 h = layer(h)
+#                 if t_emb!=None:
+#                     # inject BEFORE activation
+#                     h = h + t_emb
+#             else:
+#                 h = layer(h)
+#         return h
+
+    
+    
+    
+# class UNet(nn.Module):
+#     def __init__(self, in_chan, out_chan, cond_chan, bypass=False, base_channels=64, **kwargs):
+#         super().__init__()
+#         total_in = in_chan + cond_chan
+#         self.time_emb = TimestepEmbedding(base_channels)              # embedding
+#         self.time_proj = nn.Linear(base_channels * 4, base_channels)  # project embedding to match layer outputs
+
+#         self.conv_l0 = ConvBlock(total_in, base_channels, seq='CACBA')
+#         self.down_l0 = ConvBlock(base_channels, seq='DBA')
+#         self.conv_l1 = ConvBlock(base_channels, seq='CBACBA')
+#         self.down_l1 = ConvBlock(base_channels, seq='DBA')
+
+#         self.conv_c = ConvBlock(base_channels, seq='CBACBA')
+
+#         self.up_r1 = ConvBlock(base_channels, seq='UBA')
+#         self.conv_r1 = ConvBlock(base_channels*2, base_channels, base_channels, seq='CBACBA') # change middle channel here (reduce by a factor of 2)
+#         self.up_r0 = ConvBlock(base_channels, seq='UBA')
+#         self.conv_r0 = ConvBlock(base_channels*2, out_chan, seq='CAC')
+
+#         self.bypass = in_chan == out_chan
+
+#     def forward(self, x_t, t, cond):
+#         # Time embedding
+#         t_emb = self.time_proj(F.silu(self.time_emb(t)))   # (N, C)
+#         t_emb = t_emb[:, :, None, None, None] # Broadcast it
+# #         if self.bypass:
+# #             x0 = x
+
+#         x = torch.cat([x_t, cond], dim=1)
+    
+#         # Encoder
+#         y0 = self.conv_l0(x, t_emb)
+#         x = self.down_l0(y0, t_emb)
+        
+
+#         y1 = self.conv_l1(x, t_emb)
+#         x = self.down_l1(y1, t_emb)
+
+#                       # (N, C, 1,1,1)
+            
+#         # Bottleneck
+#         x = self.conv_c(x, t_emb)
+# #         x = x + t_emb  # inject
+
+
+#         # Decoder
+#         x = self.up_r1(x, t_emb)
+# #         y1 = narrow_by(y1, 4)
+#         x = torch.cat([y1, x], dim=1) # Skip connection
+#         x = self.conv_r1(x, t_emb)
+
+#         x = self.up_r0(x, t_emb)
+# #         y0 = narrow_by(y0, 2)
+#         x = torch.cat([y0, x], dim=1) # Skip connection
+#         x = self.conv_r0(x,t_emb)
+
+# #         if self.bypass:
+# #             x += x0
+
+#         return x
+
+
